@@ -11,7 +11,7 @@ from sqs_workers import DEFAULT_BACKOFF, codecs
 from sqs_workers.async_task import AsyncTask
 from sqs_workers.backoff_policies import BackoffPolicy
 from sqs_workers.core import BatchProcessingResult, get_job_name
-from sqs_workers.exceptions import SQSError
+from sqs_workers.exceptions import SQSError, FailedTasksError
 from sqs_workers.processors import DEFAULT_CONTEXT_VAR, Processor
 from sqs_workers.shutdown_policies import NEVER_SHUTDOWN
 
@@ -46,11 +46,7 @@ class GenericQueue(object):
         """
         logger.debug(
             "Start processing queue {}".format(self.name),
-            extra={
-                "queue_name": self.name,
-                "wait_seconds": wait_second,
-                "shutdown_policy": repr(shutdown_policy),
-            },
+            extra={"queue_name": self.name, "wait_seconds": wait_second, "shutdown_policy": repr(shutdown_policy),},
         )
         while True:
             result = self.process_batch(wait_seconds=wait_second)
@@ -58,11 +54,7 @@ class GenericQueue(object):
             if shutdown_policy.need_shutdown():
                 logger.debug(
                     "Stop processing queue {}".format(self.name),
-                    extra={
-                        "queue_name": self.name,
-                        "wait_seconds": wait_second,
-                        "shutdown_policy": repr(shutdown_policy),
-                    },
+                    extra={"queue_name": self.name, "wait_seconds": wait_second, "shutdown_policy": repr(shutdown_policy),},
                 )
                 break
 
@@ -88,6 +80,10 @@ class GenericQueue(object):
             else:
                 timeout = self.backoff_policy.get_visibility_timeout(message)
                 message.change_visibility(VisibilityTimeout=timeout)
+        if self.is_lambda_env() and result.failed_count() > 0:
+            # We need to raise an exception to prevent AWS from deleting failed
+            # messages from the queue
+            raise FailedTasksError(result)
         return result
 
     def process_message(self, message):
@@ -103,6 +99,13 @@ class GenericQueue(object):
         """
         Return raw messages from the queue, addressed by its name
         """
+        if self.is_lambda_env():
+            try:
+                messages = self.env.context["event"]["Records"]
+                return [messages.pop() for _ in messages]
+            except KeyError:
+                pass
+
         kwargs = {
             "WaitTimeSeconds": wait_seconds,
             "MaxNumberOfMessages": 10,
@@ -122,13 +125,13 @@ class GenericQueue(object):
             messages = self.get_raw_messages(wait_seconds)
             if not messages:
                 break
-            entries = [
-                {"Id": msg.message_id, "ReceiptHandle": msg.receipt_handle}
-                for msg in messages
-            ]
+            entries = [{"Id": msg.message_id, "ReceiptHandle": msg.receipt_handle} for msg in messages]
             queue.delete_messages(Entries=entries)
             deleted_count += len(messages)
         return deleted_count
+
+    def is_lambda_env(self):
+        return self.env.is_lambda_env()
 
     def get_sqs_queue_name(self):
         """
@@ -143,9 +146,7 @@ class GenericQueue(object):
         Helper function to return queue object.
         """
         if self._queue is None:
-            self._queue = self.env.sqs_resource.get_queue_by_name(
-                QueueName=self.get_sqs_queue_name()
-            )
+            self._queue = self.env.sqs_resource.get_queue_by_name(QueueName=self.get_sqs_queue_name())
         return self._queue
 
 
@@ -180,8 +181,7 @@ class RawQueue(GenericQueue):
             "processor_name": processor.__module__ + "." + processor.__name__,
         }
         logger.debug(
-            "Connect {queue_name} to " "processor {processor_name}".format(**extra),
-            extra=extra,
+            "Connect {queue_name} to " "processor {processor_name}".format(**extra), extra=extra,
         )
         self.processor = processor
 
@@ -224,9 +224,7 @@ class RawQueue(GenericQueue):
         """
         extra = {"message_id": message.message_id, "queue_name": self.name}
         if not self.processor:
-            logger.warning(
-                "No processor set for {queue_name}".format(**extra), extra=extra
-            )
+            logger.warning("No processor set for {queue_name}".format(**extra), extra=extra)
             return False
 
         logger.debug("Process {queue_name}.{message_id}".format(**extra), extra=extra)
@@ -235,8 +233,7 @@ class RawQueue(GenericQueue):
             self.processor(message)
         except Exception:
             logger.exception(
-                "Error while processing {queue_name}.{message_id}".format(**extra),
-                extra=extra,
+                "Error while processing {queue_name}.{message_id}".format(**extra), extra=extra,
             )
             return False
         else:
@@ -278,15 +275,11 @@ class JobQueue(GenericQueue):
         """
 
         def fn(processor):
-            return self.connect_processor(
-                job_name, processor, pass_context, context_var
-            )
+            return self.connect_processor(job_name, processor, pass_context, context_var)
 
         return fn
 
-    def connect_processor(
-        self, job_name, processor, pass_context=False, context_var=DEFAULT_CONTEXT_VAR
-    ):
+    def connect_processor(self, job_name, processor, pass_context=False, context_var=DEFAULT_CONTEXT_VAR):
         """
         Assign processor (a function) to handle jobs with the name job_name
         from the queue queue_name
@@ -297,17 +290,9 @@ class JobQueue(GenericQueue):
             "processor_name": processor.__module__ + "." + processor.__name__,
         }
         logger.debug(
-            "Connect {queue_name}.{job_name} to "
-            "processor {processor_name}".format(**extra),
-            extra=extra,
+            "Connect {queue_name}.{job_name} to " "processor {processor_name}".format(**extra), extra=extra,
         )
-        self.processors[job_name] = self.env.processor_maker(
-            queue=self,
-            fn=processor,
-            pass_context=pass_context,
-            context_var=context_var,
-            job_name=job_name,
-        )
+        self.processors[job_name] = self.env.processor_maker(queue=self, fn=processor, pass_context=pass_context, context_var=context_var, job_name=job_name,)
         return AsyncTask(self, job_name, processor)
 
     def get_processor(self, job_name):
@@ -369,15 +354,7 @@ class JobQueue(GenericQueue):
                     error["_message"] = msg_by_id[err["Id"]]
                 raise SQSBatchError(errors)
 
-    def add_job(
-        self,
-        job_name,
-        _content_type=codecs.DEFAULT_CONTENT_TYPE,
-        _delay_seconds=None,
-        _deduplication_id=None,
-        _group_id=None,
-        **job_kwargs
-    ):
+    def add_job(self, job_name, _content_type=codecs.DEFAULT_CONTENT_TYPE, _delay_seconds=None, _deduplication_id=None, _group_id=None, **job_kwargs):
         """
         Add job to the queue. The body of the job will be converted to the text
         with one of the codes (by default it's "pickle")
@@ -385,25 +362,10 @@ class JobQueue(GenericQueue):
         codec = codecs.get_codec(_content_type)
         message_body = codec.serialize(job_kwargs)
         job_context = codec.serialize(self.env.context.to_dict())
-        return self.add_raw_job(
-            job_name,
-            message_body,
-            job_context,
-            _content_type,
-            _delay_seconds,
-            _deduplication_id,
-            _group_id,
-        )
+        return self.add_raw_job(job_name, message_body, job_context, _content_type, _delay_seconds, _deduplication_id, _group_id,)
 
     def add_raw_job(
-        self,
-        job_name,
-        message_body,
-        job_context,
-        content_type,
-        delay_seconds,
-        deduplication_id,
-        group_id,
+        self, job_name, message_body, job_context, content_type, delay_seconds, deduplication_id, group_id,
     ):
         """
         Low-level function to put message to the queue
@@ -452,9 +414,7 @@ class JobQueue(GenericQueue):
             return self.process_message_fallback(message)
 
     def process_message_fallback(self, message):
-        warnings.warn(
-            "Error while processing {}.{}".format(self.name, get_job_name(message))
-        )
+        warnings.warn("Error while processing {}.{}".format(self.name, get_job_name(message)))
         return False
 
     def copy_processors(self, dst_queue):

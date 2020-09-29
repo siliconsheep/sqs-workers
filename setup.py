@@ -26,14 +26,7 @@ setup(
     python_requires=">=2.7",
     url="https://github.com/Doist/sqs-workers",
     packages=find_packages(exclude=["tests"]),
-    install_requires=[
-        "boto3",
-        "future",
-        "pytest-runner",
-        "attrs",
-        "typing",
-        "werkzeug",
-    ],
+    install_requires=["boto3", "requests", "future", "pytest-runner", "attrs", "typing", "werkzeug",],
     include_package_data=True,
     license="MIT",
     classifiers=[

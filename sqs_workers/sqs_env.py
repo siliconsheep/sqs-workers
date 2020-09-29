@@ -1,10 +1,12 @@
 import logging
 import multiprocessing
 import warnings
+import os
 from typing import TYPE_CHECKING, Dict, Optional, Type, Union
 
 import attr
 import boto3
+import requests
 
 from sqs_workers import DEFAULT_BACKOFF, RawQueue, codecs, context, processors
 from sqs_workers.core import RedrivePolicy
@@ -42,6 +44,13 @@ class SQSEnv(object):
     queues = attr.ib(init=False, factory=dict)  # type: Dict[str, AnyQueue]
 
     def __attrs_post_init__(self):
+        if "AWS_DEFAULT_REGION" not in os.environ:
+            try:
+                os.environ["AWS_DEFAULT_REGION"] = (
+                    requests.get("http://169.254.169.254/latest/dynamic/instance-identity/document", timeout=2).json().get("region")
+                )
+            except requests.RequestError:
+                pass
         self.context = self.context_maker()
         self.sqs_client = self.session.client("sqs")
         self.sqs_resource = self.session.resource("sqs")
@@ -58,21 +67,15 @@ class SQSEnv(object):
         """
         if queue_name not in self.queues:
             backoff_policy = backoff_policy or self.backoff_policy
-            self.queues[queue_name] = queue_maker(
-                env=self, name=queue_name, backoff_policy=backoff_policy
-            )
+            self.queues[queue_name] = queue_maker(env=self, name=queue_name, backoff_policy=backoff_policy)
         return self.queues[queue_name]
 
-    def processor(
-        self, queue_name, job_name, pass_context=False, context_var=DEFAULT_CONTEXT_VAR
-    ):
+    def processor(self, queue_name, job_name, pass_context=False, context_var=DEFAULT_CONTEXT_VAR):
         """
         Decorator to attach processor to all jobs "job_name" of the queue "queue_name".
         """
         q = self.queue(queue_name, queue_maker=JobQueue)  # type: JobQueue
-        return q.processor(
-            job_name=job_name, pass_context=pass_context, context_var=context_var
-        )
+        return q.processor(job_name=job_name, pass_context=pass_context, context_var=context_var)
 
     def raw_processor(self, queue_name):
         """
@@ -82,30 +85,17 @@ class SQSEnv(object):
         return q.raw_processor()
 
     def add_job(
-        self,
-        queue_name,
-        job_name,
-        _content_type=codecs.DEFAULT_CONTENT_TYPE,
-        _delay_seconds=None,
-        _deduplication_id=None,
-        _group_id=None,
-        **job_kwargs
+        self, queue_name, job_name, _content_type=codecs.DEFAULT_CONTENT_TYPE, _delay_seconds=None, _deduplication_id=None, _group_id=None, **job_kwargs
     ):
         """
         Add job to the queue.
         """
         warnings.warn(
-            "sqs.add_job() is deprecated. Use sqs.queue(...).add_job() instead",
-            DeprecationWarning,
+            "sqs.add_job() is deprecated. Use sqs.queue(...).add_job() instead", DeprecationWarning,
         )
         q = self.queue(queue_name, queue_maker=JobQueue)  # type: JobQueue
         return q.add_job(
-            job_name,
-            _content_type=_content_type,
-            _delay_seconds=_delay_seconds,
-            _deduplication_id=_deduplication_id,
-            _group_id=_group_id,
-            **job_kwargs
+            job_name, _content_type=_content_type, _delay_seconds=_delay_seconds, _deduplication_id=_deduplication_id, _group_id=_group_id, **job_kwargs
         )
 
     def process_queues(self, queue_names=None, shutdown_policy_maker=NeverShutdown):
@@ -125,10 +115,7 @@ class SQSEnv(object):
         processes = []
         for queue_name in queue_names:
             queue = self.queue(queue_name)
-            p = multiprocessing.Process(
-                target=queue.process_queue,
-                kwargs={"shutdown_policy": shutdown_policy_maker()},
-            )
+            p = multiprocessing.Process(target=queue.process_queue, kwargs={"shutdown_policy": shutdown_policy_maker()},)
             p.start()
             processes.append(p)
         for p in processes:
@@ -153,6 +140,9 @@ class SQSEnv(object):
         for different environments (development, staging, production, etc)
         """
         return "{}{}".format(self.queue_prefix, queue_name)
+
+    def is_lambda_env(self):
+        return "LAMBDA_TASK_ROOT" in os.environ or "AWS_EXECUTION_ENV" in os.environ
 
     def redrive_policy(self, dead_letter_queue_name, max_receive_count):
         return RedrivePolicy(self, dead_letter_queue_name, max_receive_count)
